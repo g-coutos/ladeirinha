@@ -215,14 +215,14 @@ func formatElev(m float64) string {
 	for i := cut; i < len(s); i += 3 {
 		out += "," + s[i:i+3]
 	}
-	return out + "m"
+	return out + " m"
 }
 
 func buildComment(activityType string, yearly float64, year int) string {
 	if strings.Contains(activityType, "Ride") {
-		return fmt.Sprintf("🚵 %d = %s m | 👉 ladeirinha.com.br", year, formatElev(yearly))
+		return fmt.Sprintf("🚵 %d = %s | 👉 ladeirinha.com.br", year, formatElev(yearly))
 	}
-	return fmt.Sprintf("⛰️ %d = %s m | 👉 ladeirinha.com.br", year, formatElev(yearly))
+	return fmt.Sprintf("⛰️ %d = %s | 👉 ladeirinha.com.br", year, formatElev(yearly))
 }
 
 func updateDescription(activityID int64, text, token string) error {
