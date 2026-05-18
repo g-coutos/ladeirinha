@@ -1,1 +1,1 @@
-web: ./climbprint
+web: ./ladeirinha
