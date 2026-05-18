@@ -220,9 +220,9 @@ func formatElev(m float64) string {
 
 func buildComment(activityType string, yearly float64, year int) string {
 	if strings.Contains(activityType, "Ride") {
-		return fmt.Sprintf("🚴‍♂️⬆️ %d = %s | by climbprint", year, formatElev(yearly))
+		return fmt.Sprintf("🚵 %d = %s m | 👉 ladeirinha.com.br", year, formatElev(yearly))
 	}
-	return fmt.Sprintf("🦶⬆️ %d = %s | by climbprint", year, formatElev(yearly))
+	return fmt.Sprintf("⛰️ %d = %s m | 👉 ladeirinha.com.br", year, formatElev(yearly))
 }
 
 func updateDescription(activityID int64, text, token string) error {
