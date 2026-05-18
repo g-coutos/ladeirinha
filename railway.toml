@@ -1,0 +1,2 @@
+[build]
+buildCommand = "go build -o ladeirinha ."
