@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,7 +27,9 @@ type StravaEvent struct {
 }
 
 type Activity struct {
+	ID                 int64   `json:"id"`
 	Type               string  `json:"type"`
+	StartDate          string  `json:"start_date"`
 	TotalElevationGain float64 `json:"total_elevation_gain"`
 }
 
@@ -42,6 +46,13 @@ var runTypes = map[string]bool{
 }
 
 var db *pgxpool.Pool
+
+var errActivityNotFound = errors.New("target activity not found in list")
+
+const (
+	maxJobAttempts = 5
+	retryDelay     = 30 * time.Second
+)
 
 func activityGroup(activityType string) string {
 	if strings.Contains(activityType, "Ride") {
@@ -156,11 +167,11 @@ func getActivity(id int64, token string) (*Activity, error) {
 	return &a, nil
 }
 
-func getYearlyElevation(token string, year int, group string) (float64, error) {
+func getYearlyElevation(token string, year int, group string, activityID int64) (float64, error) {
 	after := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 	before := time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
 
-	var total float64
+	var all []Activity
 	page := 1
 
 	for {
@@ -185,24 +196,42 @@ func getYearlyElevation(token string, year int, group string) (float64, error) {
 			return 0, fmt.Errorf("activities returned %d: %s", resp.StatusCode, body)
 		}
 
-		var activities []Activity
-		if err := json.NewDecoder(resp.Body).Decode(&activities); err != nil {
+		var page_activities []Activity
+		if err := json.NewDecoder(resp.Body).Decode(&page_activities); err != nil {
 			resp.Body.Close()
 			return 0, fmt.Errorf("activities decode failed: %w", err)
 		}
 		resp.Body.Close()
 
-		if len(activities) == 0 {
+		if len(page_activities) == 0 {
 			break
 		}
 
-		for _, a := range activities {
-			if activityGroup(a.Type) == group {
-				total += a.TotalElevationGain
-			}
-		}
-
+		all = append(all, page_activities...)
 		page++
+	}
+
+	// Sort ascending by start_date so we accumulate in chronological order.
+	// Strava returns ISO 8601 dates which are lexicographically sortable.
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].StartDate < all[j].StartDate
+	})
+
+	var total float64
+	found := false
+	for _, a := range all {
+		if activityGroup(a.Type) != group {
+			continue
+		}
+		total += a.TotalElevationGain
+		if a.ID == activityID {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return 0, errActivityNotFound
 	}
 
 	return total, nil
@@ -258,42 +287,113 @@ func updateDescription(activityID int64, text, token string) error {
 	return nil
 }
 
-func processActivity(athleteID, activityID int64) {
+func enqueueJob(ctx context.Context, athleteID, activityID int64) error {
+	_, err := db.Exec(ctx,
+		`INSERT INTO jobs (athlete_id, activity_id) VALUES ($1, $2)`,
+		athleteID, activityID,
+	)
+	return err
+}
+
+func runNextJob(ctx context.Context) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		log.Printf("worker: begin tx: %v", err)
+		return
+	}
+
+	var jobID, athleteID, activityID int64
+	var attempts int
+	err = tx.QueryRow(ctx, `
+		SELECT id, athlete_id, activity_id, attempts
+		FROM jobs
+		WHERE status = 'pending' AND scheduled_at <= NOW()
+		ORDER BY scheduled_at
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`).Scan(&jobID, &athleteID, &activityID, &attempts)
+	if err != nil {
+		tx.Rollback(ctx)
+		return // no jobs ready
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE jobs SET status = 'processing' WHERE id = $1`, jobID); err != nil {
+		tx.Rollback(ctx)
+		return
+	}
+	tx.Commit(ctx)
+
+	attempts++
+	if err := processActivity(athleteID, activityID); err != nil {
+		if attempts >= maxJobAttempts {
+			log.Printf("worker: job %d failed permanently after %d attempts: %v", jobID, attempts, err)
+			db.Exec(ctx, `UPDATE jobs SET status = 'failed', attempts = $1 WHERE id = $2`, attempts, jobID)
+		} else {
+			next := time.Now().Add(retryDelay)
+			db.Exec(ctx, `UPDATE jobs SET status = 'pending', attempts = $1, scheduled_at = $2 WHERE id = $3`,
+				attempts, next, jobID)
+			log.Printf("worker: job %d attempt %d failed, retry at %v: %v", jobID, attempts, next, err)
+		}
+		return
+	}
+
+	db.Exec(ctx, `UPDATE jobs SET status = 'done', attempts = $1 WHERE id = $2`, attempts, jobID)
+}
+
+func startWorker(ctx context.Context) {
+	// Reset jobs stuck in processing (e.g. from a previous crash).
+	if _, err := db.Exec(ctx, `
+		UPDATE jobs SET status = 'pending', scheduled_at = NOW()
+		WHERE status = 'processing'
+	`); err != nil {
+		log.Printf("worker: reset stuck jobs: %v", err)
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runNextJob(ctx)
+		}
+	}
+}
+
+func processActivity(athleteID, activityID int64) error {
 	ctx := context.Background()
 
 	token, err := getAccessToken(ctx, athleteID)
 	if err != nil {
-		log.Printf("processActivity %d: getAccessToken: %v", activityID, err)
-		return
+		return fmt.Errorf("getAccessToken: %w", err)
 	}
 
 	activity, err := getActivity(activityID, token)
 	if err != nil {
-		log.Printf("processActivity %d: getActivity: %v", activityID, err)
-		return
+		return fmt.Errorf("getActivity: %w", err)
 	}
 
 	group := activityGroup(activity.Type)
 	if group == "other" {
 		log.Printf("processActivity %d: unsupported activity type %q, skipping", activityID, activity.Type)
-		return
+		return nil
 	}
 
 	year := time.Now().Year()
-	yearly, err := getYearlyElevation(token, year, group)
+	yearly, err := getYearlyElevation(token, year, group, activityID)
 	if err != nil {
-		log.Printf("processActivity %d: getYearlyElevation: %v", activityID, err)
-		return
+		return fmt.Errorf("getYearlyElevation: %w", err)
 	}
 
 	comment := buildComment(activity.Type, yearly, year)
 	if err := updateDescription(activityID, comment, token); err != nil {
-		log.Printf("processActivity %d: updateDescription: %v", activityID, err)
-		return
+		return fmt.Errorf("updateDescription: %w", err)
 	}
 
 	log.Printf("processActivity %d: description updated (athlete=%d, type=%s, yearly=%.0fm, this=%.0fm)",
 		activityID, athleteID, activity.Type, yearly, activity.TotalElevationGain)
+	return nil
 }
 
 func authHandler(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +478,11 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		go processActivity(event.OwnerID, event.ObjectID)
+		if err := enqueueJob(r.Context(), event.OwnerID, event.ObjectID); err != nil {
+			log.Printf("webhookHandler: enqueueJob: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 
 	default:
@@ -414,6 +518,22 @@ func main() {
 	`); err != nil {
 		log.Fatalf("failed to create athletes table: %v", err)
 	}
+
+	if _, err = db.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS jobs (
+			id           BIGSERIAL PRIMARY KEY,
+			athlete_id   BIGINT NOT NULL,
+			activity_id  BIGINT NOT NULL,
+			status       TEXT NOT NULL DEFAULT 'pending',
+			attempts     INT NOT NULL DEFAULT 0,
+			scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`); err != nil {
+		log.Fatalf("failed to create jobs table: %v", err)
+	}
+
+	go startWorker(ctx)
 
 	port := os.Getenv("PORT")
 	if port == "" {
