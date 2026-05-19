@@ -32,6 +32,9 @@ type Activity struct {
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	Athlete      struct {
+		ID int64 `json:"id"`
+	} `json:"athlete"`
 }
 
 var runTypes = map[string]bool{
@@ -293,6 +296,59 @@ func processActivity(athleteID, activityID int64) {
 		activityID, athleteID, activity.Type, yearly, activity.TotalElevationGain)
 }
 
+func authHandler(w http.ResponseWriter, r *http.Request) {
+	authURL := fmt.Sprintf(
+		"https://www.strava.com/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=activity:read_all,activity:write",
+		os.Getenv("STRAVA_CLIENT_ID"),
+		url.QueryEscape(os.Getenv("STRAVA_REDIRECT_URI")),
+	)
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func authCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+
+	data := url.Values{}
+	data.Set("client_id", os.Getenv("STRAVA_CLIENT_ID"))
+	data.Set("client_secret", os.Getenv("STRAVA_CLIENT_SECRET"))
+	data.Set("code", code)
+	data.Set("grant_type", "authorization_code")
+
+	resp, err := http.PostForm("https://www.strava.com/oauth/token", data)
+	if err != nil {
+		http.Error(w, "token request failed", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("authCallback: strava token error %d: %s", resp.StatusCode, body)
+		http.Error(w, "strava authorization failed", http.StatusBadGateway)
+		return
+	}
+
+	var tr tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		http.Error(w, "token decode failed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := saveRefreshToken(r.Context(), tr.Athlete.ID, tr.RefreshToken); err != nil {
+		log.Printf("authCallback: saveRefreshToken athlete %d: %v", tr.Athlete.ID, err)
+		http.Error(w, "failed to save token", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("authCallback: athlete %d authorized", tr.Athlete.ID)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<html><body><p>Autorizado com sucesso! Suas atividades serão atualizadas automaticamente.</p></body></html>`)
+}
+
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -364,6 +420,8 @@ func main() {
 		port = "8080"
 	}
 
+	http.HandleFunc("/auth", authHandler)
+	http.HandleFunc("/auth/callback", authCallbackHandler)
 	http.HandleFunc("/webhook", webhookHandler)
 	http.HandleFunc("/health", healthHandler)
 
