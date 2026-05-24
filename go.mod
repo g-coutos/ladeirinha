@@ -1,4 +1,4 @@
-module github.com/user/climbprint
+module github.com/user/ladeirinha
 
 go 1.25.0
 

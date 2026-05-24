@@ -10,10 +10,10 @@ A single-file Go webhook server that listens for Strava activity creation events
 
 ```sh
 # Build
-go build -o climbprint .
+go build -o ladeirinha .
 
 # Run locally (requires .env)
-./climbprint
+./ladeirinha
 
 # Run without building
 go run .
@@ -70,4 +70,4 @@ Two tables created automatically on startup (also in `schema.sql`):
 
 ## Deployment
 
-Deployed on Railway. The `Procfile` runs the compiled binary `./climbprint`. Railway builds with `go build -o climbprint .` automatically via `railway.toml`.
+Deployed on Railway. The `Procfile` runs the compiled binary `./ladeirinha`. Railway builds with `go build -o ladeirinha .` automatically via `railway.toml`.
